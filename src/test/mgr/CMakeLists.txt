@@ -1,9 +1,46 @@
+#unittest_mgr_activepymodule
+#add_executable(unittest_mgr_activepymodule
+#  test_activepymodule.cc)
+#add_ceph_unittest(unittest_mgr_activepymodule)
+#target_link_libraries(unittest_mgr_activepymodule global
+#  ${CMAKE_SOURCE_DIR}/src/ceph_mgr.cc
+#  ${CMAKE_SOURCE_DIR}/src/mon/PGMap.cc
+#  ${CMAKE_SOURCE_DIR}/src/mon/ConfigMap.cc
+#  ceph-common
+#  Boost::python${MGR_PYTHON_VERSION_MAJOR}${MGR_PYTHON_VERSION_MINOR}
+#  Python3::Python
+#  cephsqlite
+#  SQLite3::SQLite3
+#  ${ALLOC_LIBS}
+#  ${CMAKE_DL_LIBS}
+#  ${GSSAPI_LIBRARIES})
+
+# unittest_mgr_clusterstate
+add_executable(unittest_mgr_clusterstate test_clusterstate.cc ${CMAKE_SOURCE_DIR}/src/mgr/ClusterState.cc)
+add_ceph_unittest(unittest_mgr_clusterstate)
+target_link_libraries(unittest_mgr_clusterstate
+  ceph-common
+  Python3::Python
+  ${CMAKE_DL_LIBS}
+  ${GSSAPI_LIBRARIES})
+
+# unittest_mgr_daemonkey
+add_executable(unittest_mgr_daemonkey test_daemonkey.cc ${CMAKE_SOURCE_DIR}/src/mgr/DaemonKey.cc)
+add_ceph_unittest(unittest_mgr_daemonkey)
+target_link_libraries(unittest_mgr_daemonkey ceph-common)
+
 # unittest_mgr_mgrcap
 add_executable(unittest_mgr_mgrcap
   test_mgrcap.cc
   $<TARGET_OBJECTS:mgr_cap_obj>)
 add_ceph_unittest(unittest_mgr_mgrcap)
 target_link_libraries(unittest_mgr_mgrcap global)
+
+# unittest_mgr_pyutil
+add_executable(unittest_mgr_pyutil test_pyutil.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyUtil.cc)
+add_ceph_unittest(unittest_mgr_pyutil)
+target_link_libraries(unittest_mgr_pyutil ceph-common
+  Python3::Python)
 
 # unittest_mgr_ttlcache
 add_executable(unittest_mgr_ttlcache test_ttlcache.cc)
