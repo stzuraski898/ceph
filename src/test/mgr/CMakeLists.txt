@@ -36,6 +36,18 @@ add_executable(unittest_mgr_mgrcap
 add_ceph_unittest(unittest_mgr_mgrcap)
 target_link_libraries(unittest_mgr_mgrcap global)
 
+# unittest_mgr_pyformatter
+add_executable(unittest_mgr_pyformatter test_pyformatter.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyFormatter.cc)
+add_ceph_unittest(unittest_mgr_pyformatter)
+target_link_libraries(unittest_mgr_pyformatter ceph-common
+  Python3::Python)
+
+# unittest_mgr_pyosdmap
+add_executable(unittest_mgr_pyosdmap test_pyosdmap.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyOSDMap.cc)
+add_ceph_unittest(unittest_mgr_pyosdmap)
+target_link_libraries(unittest_mgr_pyosdmap ceph-common
+  Python3::Python)
+
 # unittest_mgr_pyutil
 add_executable(unittest_mgr_pyutil test_pyutil.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyUtil.cc)
 add_ceph_unittest(unittest_mgr_pyutil)

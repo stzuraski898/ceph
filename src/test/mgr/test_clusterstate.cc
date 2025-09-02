@@ -55,7 +55,7 @@ TEST(ClusterState, IngestPGStats)
     ClusterState cs(monClient, objecter, mgrMap);
     auto pgStats = ceph::make_message<MPGStats>();
 
-    //An ceph assert (ceph_assert(objecter != nullptr)) causes this test to core dump, need to implement a dummy Objecter or create a full one
+    //A ceph assert (ceph_assert(objecter != nullptr)) causes this test to core dump, need to implement a dummy Objecter or create a full one
     //cs.ingest_pgstats(pgStats);
     SUCCEED();
 }
