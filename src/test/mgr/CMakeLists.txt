@@ -42,16 +42,23 @@ add_ceph_unittest(unittest_mgr_pyformatter)
 target_link_libraries(unittest_mgr_pyformatter ceph-common
   Python3::Python)
 
-# unittest_mgr_pyosdmap
-add_executable(unittest_mgr_pyosdmap test_pyosdmap.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyOSDMap.cc)
-add_ceph_unittest(unittest_mgr_pyosdmap)
-target_link_libraries(unittest_mgr_pyosdmap ceph-common
-  Python3::Python)
+# unittest_mgr_pymodule
+add_executable(unittest_mgr_pymodule test_pymodule.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyModule.cc)
+add_ceph_unittest(unittest_mgr_pymodule)
+target_link_libraries(unittest_mgr_pymodule ceph-common
+  Python3::Python ${CMAKE_DL_LIBS})
+
 
 # unittest_mgr_pyutil
 add_executable(unittest_mgr_pyutil test_pyutil.cc ${CMAKE_SOURCE_DIR}/src/mgr/PyUtil.cc)
 add_ceph_unittest(unittest_mgr_pyutil)
 target_link_libraries(unittest_mgr_pyutil ceph-common
+  Python3::Python)
+
+# unittest_mgr_pyservicemap
+add_executable(unittest_mgr_servicemap test_servicemap.cc ${CMAKE_SOURCE_DIR}/src/mgr/ServiceMap.cc)
+add_ceph_unittest(unittest_mgr_servicemap)
+target_link_libraries(unittest_mgr_servicemap ceph-common
   Python3::Python)
 
 # unittest_mgr_ttlcache
