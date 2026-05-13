@@ -1076,21 +1076,27 @@ PyObject* ActivePyModules::get_unlabeled_perf_schema_python(
   if (!daemons.empty()) {
     for (auto& [key, state] : daemons) {
       std::lock_guard l(state->lock);
+      
+      // Skip daemons with no perf counter instances - nothing to report
+      if (state->perf_counters.instances.empty()) {
+        continue;
+      }
+      
       with_gil(no_gil, [&, key=ceph::to_string(key), state=state] {
-        f.open_object_section(key.c_str());
+        Formatter::ObjectSection daemon_section(f, key.c_str());
         for (auto ctr_inst_iter : state->perf_counters.instances) {
           const auto &counter_name = ctr_inst_iter.first;
 
-	  // Ignore labeled counters. The perf schema format below can not
-	  // accomodate counters with labels. A new representation format is
-	  // requried to do support this.
-	  auto labels = ceph::perf_counters::key_labels(counter_name);
-	  if (labels.begin() != labels.end()) {
-	    continue;
-	  }
+   // Ignore labeled counters. The perf schema format below can not
+   // accomodate counters with labels. A new representation format is
+   // requried to do support this.
+   auto labels = ceph::perf_counters::key_labels(counter_name);
+   if (labels.begin() != labels.end()) {
+     continue;
+   }
 
-	  f.open_object_section(counter_name.c_str());
-	  auto type = state->perf_counters.types[counter_name];
+   Formatter::ObjectSection counter_section(f, counter_name.c_str());
+   auto type = state->perf_counters.types[counter_name];
           f.dump_string("description", type.description);
           if (!type.nick.empty()) {
             f.dump_string("nick", type.nick);
@@ -1098,9 +1104,9 @@ PyObject* ActivePyModules::get_unlabeled_perf_schema_python(
           f.dump_unsigned("type", type.type);
           f.dump_unsigned("priority", type.priority);
           f.dump_unsigned("units", type.unit);
-          f.close_section();
+          // counter_section closes automatically via RAII
         }
-        f.close_section();
+        // daemon_section closes automatically via RAII
       });
     }
   } else {
@@ -1168,16 +1174,24 @@ PyObject* ActivePyModules::get_perf_schema_python(
   if (!daemons.empty()) {
     for (auto &[key, state] : daemons) {
       std::lock_guard l(state->lock);
+      
+      // Skip daemons with no perf counter instances - nothing to report
+      if (state->perf_counters.instances.empty()) {
+        continue;
+      }
+      
       with_gil(no_gil, [&, key = ceph::to_string(key), state = state] {
-	std::string key_name, prev_key_name;
-	perf_counter_label_pairs prev_key_labels;
-	Formatter::ObjectSection counter_section(
-	    f, key.c_str());  // Main Object Section
-	std::optional<Formatter::ArraySection> array_section;
+ std::string key_name, prev_key_name;
+ perf_counter_label_pairs prev_key_labels;
+ Formatter::ObjectSection counter_section(
+     f, key.c_str());  // Main Object Section
+ std::optional<Formatter::ArraySection> array_section;
+ std::optional<Formatter::ObjectSection> counter_object_section;
+ std::optional<Formatter::ObjectSection> counters_section;
 
-	for (const auto &[counter_name_with_labels, _] :
-	     state->perf_counters.instances) {
-	  /*
+ for (const auto &[counter_name_with_labels, _] :
+      state->perf_counters.instances) {
+   /*
               The path of the counter can either be:
                 - labeled counter path: "osd_scrub_sh_repl^@level^@shallow^@pooltype^@replicated^@.successful_scrubs_elapsed"
                 - unlabeled counter path: "osd.stat_bytes"
@@ -1187,27 +1201,27 @@ PyObject* ActivePyModules::get_perf_schema_python(
                 - counter names are: 'successful_scrubs_elapsed' and 'stat_bytes'
 
           */
-	  auto type = state->perf_counters.types[counter_name_with_labels];
+   auto type = state->perf_counters.types[counter_name_with_labels];
 
-	  // create a vector of labels i.e [(level, shallow), (pooltype, replicated)]
-	  perf_counter_label_pairs key_labels;
-	  auto labels =
-	      ceph::perf_counters::key_labels(counter_name_with_labels);
-	  std::copy_if(
-	      labels.begin(), labels.end(), std::back_inserter(key_labels),
-	      [](const auto &label) { return !label.first.empty(); });
+   // create a vector of labels i.e [(level, shallow), (pooltype, replicated)]
+   perf_counter_label_pairs key_labels;
+   auto labels =
+       ceph::perf_counters::key_labels(counter_name_with_labels);
+   std::copy_if(
+       labels.begin(), labels.end(), std::back_inserter(key_labels),
+       [](const auto &label) { return !label.first.empty(); });
 
-	  // Extract the key names from the counter path, these key names form
-	  // the main object section for their counters
-	  if (key_labels.empty()) {
-	    size_t pos = counter_name_with_labels.rfind('.');
-	    key_name = counter_name_with_labels.substr(0, pos);  // key_name, osd
-	  } else {
-	    // key_name, osd_scrub_sh_repl
-	    key_name = std::string(ceph::perf_counters::key_name(counter_name_with_labels));
-	  }
+   // Extract the key names from the counter path, these key names form
+   // the main object section for their counters
+   if (key_labels.empty()) {
+     size_t pos = counter_name_with_labels.rfind('.');
+     key_name = counter_name_with_labels.substr(0, pos);  // key_name, osd
+   } else {
+     // key_name, osd_scrub_sh_repl
+     key_name = std::string(ceph::perf_counters::key_name(counter_name_with_labels));
+   }
 
-	  /*
+   /*
             Construct a schema in the following format
             {
               "osd": [
@@ -1240,33 +1254,44 @@ PyObject* ActivePyModules::get_perf_schema_python(
             }
           */
 
-	  if (prev_key_name != key_name) {
-	    if (!prev_key_name.empty()) {
-	      f.close_section();  // close 'counters'
-	      f.close_section();  // close 'counter object' section
-	    }
-	    prev_key_name = key_name;
-	    prev_key_labels = key_labels;
-	    array_section.emplace(f, key_name);
-	    dump_counter_with_labels(&f, key_labels, type);
-	  } else if (
-	      prev_key_name == key_name && prev_key_labels == key_labels) {
-	    dump_sub_counter_information(&f, type);
-	  } else if (
-	      prev_key_name == key_name && prev_key_labels != key_labels) {
-	    f.close_section();	// close previous 'counters' section
-	    f.close_section();	// close previous counter object section
-	    dump_counter_with_labels(&f, key_labels, type);
-	  } else {
-	    dout(4)
-		<< fmt::format(
-		       "{} unable to create perf schema, not a valid condition",
-		       __func__)
-		<< dendl;
-	  }
-	}
-	f.close_section();  // close 'counters'
-	f.close_section();  // close 'counter object' section
+   if (prev_key_name != key_name) {
+     // reset closes 'counters' then 'counter object' (declaration order,
+     // reversed at destruction) before emplacing the new array section
+     counters_section.reset();
+     counter_object_section.reset();
+     prev_key_name = key_name;
+     prev_key_labels = key_labels;
+     array_section.emplace(f, key_name);
+     counter_object_section.emplace(f, "");
+     for (Formatter::ObjectSection ls{f, "labels"};
+   const auto &label : key_labels) {
+       f.dump_string(label.first, label.second);
+     }
+     counters_section.emplace(f, "counters");
+     dump_sub_counter_information(&f, type);
+   } else if (
+       prev_key_name == key_name && prev_key_labels == key_labels) {
+     dump_sub_counter_information(&f, type);
+   } else if (
+       prev_key_name == key_name && prev_key_labels != key_labels) {
+     counters_section.reset();  // close previous 'counters' section
+     counter_object_section.reset();  // close previous counter object section
+     counter_object_section.emplace(f, "");
+     for (Formatter::ObjectSection ls{f, "labels"};
+   const auto &label : key_labels) {
+       f.dump_string(label.first, label.second);
+     }
+     counters_section.emplace(f, "counters");
+     dump_sub_counter_information(&f, type);
+   } else {
+     dout(4)
+  << fmt::format(
+         "{} unable to create perf schema, not a valid condition",
+         __func__)
+  << dendl;
+   }
+ }
+ // no close_section() calls needed -- all sections close via RAII
       });
     }
   } else {
