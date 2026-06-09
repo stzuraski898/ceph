@@ -6174,10 +6174,10 @@ void Monitor::prepare_new_fingerprint(MonitorDBStore::TransactionRef t)
   t->put(MONITOR_NAME, "cluster_fingerprint", bl);
 }
 
-int Monitor::check_fsid()
+static int mon_check_fsid(MonitorDBStore *store, MonMap *monmap)
 {
   bufferlist ebl;
-  int r = store->get(MONITOR_NAME, "cluster_uuid", ebl);
+  int r = store->get(Monitor::MONITOR_NAME, "cluster_uuid", ebl);
   if (r == -ENOENT)
     return r;
   ceph_assert(r == 0);
@@ -6189,20 +6189,25 @@ int Monitor::check_fsid()
   if (pos != string::npos)
     es.resize(pos);
 
-  dout(10) << "check_fsid cluster_uuid contains '" << es << "'" << dendl;
+  lgeneric_dout(g_ceph_context, 10) << "check_fsid cluster_uuid contains '" << es << "'" << dendl;
   uuid_d ondisk;
   if (!ondisk.parse(es.c_str())) {
-    derr << "error: unable to parse uuid" << dendl;
+    lgeneric_derr(g_ceph_context) << "error: unable to parse uuid" << dendl;
     return -EINVAL;
   }
 
   if (monmap->get_fsid() != ondisk) {
-    derr << "error: cluster_uuid file exists with value " << ondisk
+    lgeneric_derr(g_ceph_context) << "error: cluster_uuid file exists with value " << ondisk
 	 << ", != our uuid " << monmap->get_fsid() << dendl;
     return -EEXIST;
   }
 
   return 0;
+}
+
+int Monitor::check_fsid()
+{
+  return mon_check_fsid(store, monmap);
 }
 
 int Monitor::write_fsid()
@@ -6226,16 +6231,79 @@ int Monitor::write_fsid(MonitorDBStore::TransactionRef t)
   return 0;
 }
 
+static void mon_write_features(MonitorDBStore::TransactionRef t,
+			       const CompatSet& features)
+{
+  bufferlist bl;
+  features.encode(bl);
+  t->put(Monitor::MONITOR_NAME, COMPAT_SET_LOC, bl);
+}
+
+static bool mon_is_keyring_required(CephContext *cct)
+{
+  AuthMethodList auth_cluster_required(
+    cct,
+    cct->_conf->auth_supported.empty() ?
+      cct->_conf->auth_cluster_required : cct->_conf->auth_supported);
+  AuthMethodList auth_service_required(
+    cct,
+    cct->_conf->auth_supported.empty() ?
+      cct->_conf->auth_service_required : cct->_conf->auth_supported);
+
+  return auth_cluster_required.is_supported_auth(CEPH_AUTH_CEPHX) ||
+         auth_service_required.is_supported_auth(CEPH_AUTH_CEPHX) ||
+         auth_cluster_required.is_supported_auth(CEPH_AUTH_GSS) ||
+         auth_service_required.is_supported_auth(CEPH_AUTH_GSS);
+}
+
+static int mon_write_default_keyring(CephContext *cct, bufferlist& bl)
+{
+  ostringstream os;
+  os << cct->_conf->mon_data << "/keyring";
+
+  int err = 0;
+  int fd = ::open(os.str().c_str(), O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
+  if (fd < 0) {
+    err = -errno;
+    lgeneric_dout(cct, 0) << __func__ << " failed to open " << os.str()
+	    << ": " << cpp_strerror(err) << dendl;
+    return err;
+  }
+
+  err = bl.write_fd(fd);
+  if (!err)
+    ::fsync(fd);
+  VOID_TEMP_FAILURE_RETRY(::close(fd));
+
+  return err;
+}
+
+static void mon_extract_save_mon_key(CephContext *cct, KeyRing& keyring)
+{
+  EntityName mon_name;
+  mon_name.set_type(CEPH_ENTITY_TYPE_MON);
+  EntityAuth mon_key;
+  if (keyring.get_auth(mon_name, mon_key)) {
+    lgeneric_dout(cct, 10) << "extract_save_mon_key moving mon. key to separate keyring" << dendl;
+    KeyRing pkey;
+    pkey.add(mon_name, mon_key);
+    bufferlist bl;
+    pkey.encode_plaintext(bl);
+    mon_write_default_keyring(cct, bl);
+    keyring.remove(mon_name);
+  }
+}
+
 /*
  * this is the closest thing to a traditional 'mkfs' for ceph.
  * initialize the monitor state machines to their initial values.
  */
-int Monitor::mkfs(bufferlist& osdmapbl)
+int Monitor::mkfs(CephContext *cct, MonitorDBStore *store, MonMap *monmap,
+		  bufferlist& osdmapbl)
 {
   auto t(std::make_shared<MonitorDBStore::Transaction>());
 
-  // verify cluster fsid
-  int r = check_fsid();
+  int r = mon_check_fsid(store, monmap);
   if (r < 0 && r != -ENOENT)
     return r;
 
@@ -6244,30 +6312,27 @@ int Monitor::mkfs(bufferlist& osdmapbl)
   magicbl.append("\n");
   t->put(MONITOR_NAME, "magic", magicbl);
 
+  auto features = get_initial_supported_features();
+  mon_write_features(t, features);
 
-  features = get_initial_supported_features();
-  write_features(t);
-
-  // save monmap, osdmap, keyring.
   bufferlist monmapbl;
+  monmap->set_epoch(0);
   monmap->encode(monmapbl, CEPH_FEATURES_ALL);
-  monmap->set_epoch(0);     // must be 0 to avoid confusing first MonmapMonitor::update_from_paxos()
   t->put("mkfs", "monmap", monmapbl);
 
   if (osdmapbl.length()) {
-    // make sure it's a valid osdmap
     try {
       OSDMap om;
       om.decode(osdmapbl);
     }
     catch (ceph::buffer::error& e) {
-      derr << "error decoding provided osdmap: " << e.what() << dendl;
+      lgeneric_derr(cct) << "error decoding provided osdmap: " << e.what() << dendl;
       return -EINVAL;
     }
     t->put("mkfs", "osdmap", osdmapbl);
   }
 
-  if (is_keyring_required()) {
+  if (mon_is_keyring_required(cct)) {
     KeyRing keyring;
     string keyring_filename;
 
@@ -6283,31 +6348,37 @@ int Monitor::mkfs(bufferlist& osdmapbl)
 	  keyring.decode(i);
 	}
 	catch (const ceph::buffer::error& e) {
-	  derr << "error decoding keyring " << keyring_plaintext
+	  lgeneric_derr(cct) << "error decoding keyring " << keyring_plaintext
 	       << ": " << e.what() << dendl;
 	  return -EINVAL;
 	}
       } else {
-	derr << "unable to find a keyring on " << g_conf()->keyring
+	lgeneric_derr(cct) << "unable to find a keyring on " << g_conf()->keyring
 	     << ": " << cpp_strerror(r) << dendl;
 	return r;
       }
     } else {
-      r = keyring.load(g_ceph_context, keyring_filename);
+      r = keyring.load(cct, keyring_filename);
       if (r < 0) {
-	derr << "unable to load initial keyring " << g_conf()->keyring << dendl;
+	lgeneric_derr(cct) << "unable to load initial keyring " << g_conf()->keyring << dendl;
 	return r;
       }
     }
 
-    // put mon. key in external keyring; seed with everything else.
-    extract_save_mon_key(keyring);
+    mon_extract_save_mon_key(cct, keyring);
 
     bufferlist keyringbl;
     keyring.encode_plaintext(keyringbl);
     t->put("mkfs", "keyring", keyringbl);
   }
-  write_fsid(t);
+  ostringstream ss;
+  ss << monmap->get_fsid() << "\n";
+  string us = ss.str();
+
+  bufferlist b;
+  b.append(us);
+
+  t->put(MONITOR_NAME, "cluster_uuid", b);
   store->apply_transaction(t);
 
   return 0;
@@ -6315,40 +6386,12 @@ int Monitor::mkfs(bufferlist& osdmapbl)
 
 int Monitor::write_default_keyring(bufferlist& bl)
 {
-  ostringstream os;
-  os << g_conf()->mon_data << "/keyring";
-
-  int err = 0;
-  int fd = ::open(os.str().c_str(), O_WRONLY|O_CREAT|O_CLOEXEC, 0600);
-  if (fd < 0) {
-    err = -errno;
-    dout(0) << __func__ << " failed to open " << os.str() 
-	    << ": " << cpp_strerror(err) << dendl;
-    return err;
-  }
-
-  err = bl.write_fd(fd);
-  if (!err)
-    ::fsync(fd);
-  VOID_TEMP_FAILURE_RETRY(::close(fd));
-
-  return err;
+  return mon_write_default_keyring(cct, bl);
 }
 
 void Monitor::extract_save_mon_key(KeyRing& keyring)
 {
-  EntityName mon_name;
-  mon_name.set_type(CEPH_ENTITY_TYPE_MON);
-  EntityAuth mon_key;
-  if (keyring.get_auth(mon_name, mon_key)) {
-    dout(10) << "extract_save_mon_key moving mon. key to separate keyring" << dendl;
-    KeyRing pkey;
-    pkey.add(mon_name, mon_key);
-    bufferlist bl;
-    pkey.encode_plaintext(bl);
-    write_default_keyring(bl);
-    keyring.remove(mon_name);
-  }
+  mon_extract_save_mon_key(cct, keyring);
 }
 
 // AuthClient methods -- for mon <-> mon communication

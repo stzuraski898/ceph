@@ -530,8 +530,7 @@ int main(int argc, const char **argv)
     }
     ceph_assert(r == 0);
 
-    Monitor mon(g_ceph_context, g_conf()->name.get_id(), &store, 0, 0, &monmap);
-    r = mon.mkfs(osdmapbl);
+    r = Monitor::mkfs(g_ceph_context, &store, &monmap, osdmapbl);
     if (r < 0) {
       derr << argv[0] << ": error creating monfs: " << cpp_strerror(r) << dendl;
       exit(1);

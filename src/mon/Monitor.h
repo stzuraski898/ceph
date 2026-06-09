@@ -1024,7 +1024,8 @@ private:
 
   void handle_signal(int sig);
 
-  int mkfs(ceph::buffer::list& osdmapbl);
+  static int mkfs(CephContext *cct, MonitorDBStore *store, MonMap *monmap,
+    ceph::buffer::list& osdmapbl);
 
   /**
    * check cluster_fsid file
