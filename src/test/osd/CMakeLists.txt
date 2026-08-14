@@ -222,6 +222,14 @@ add_executable(unittest_ec_omap_journal
 add_ceph_unittest(unittest_ec_omap_journal)
 target_link_libraries(unittest_ec_omap_journal osd global ${BLKID_LIBRARIES})
 
+# unittest_primary_log_pg: coroutine lifecycle tests (leak-path coverage)
+add_executable(unittest_primary_log_pg
+  test_primary_log_pg.cc
+  $<TARGET_OBJECTS:unit-main>
+)
+add_ceph_unittest(unittest_primary_log_pg)
+target_link_libraries(unittest_primary_log_pg osd global Boost::context ${BLKID_LIBRARIES})
+
 # osd_unittests: custom target that builds and runs all OSD unit tests
 # Not including unittest_osdmap, as it is slow. It is tested elsewhere.
 set(OSD_UNITTESTS
@@ -243,6 +251,7 @@ set(OSD_UNITTESTS
   unittest_peeringstate
   unittest_pg_transaction
   unittest_pglog
+  unittest_primary_log_pg
   unittest_scrubber_be
 )
 
