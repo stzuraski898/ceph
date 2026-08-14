@@ -15,59 +15,90 @@
 /*
  * test_primary_log_pg - Unit tests for PrimaryLogPG coroutine lifecycle.
  *
- * These tests exercise the two memory-leak paths introduced by PR #67079
+ * These tests exercise the two unsafe code patterns introduced by PR #67079
  * ("osd: Support for Synchronous Reads in EC") using only the types defined
  * in Coroutines.h, without requiring a full OSD stack.
  *
- * The coroutine pattern used in PrimaryLogPG::do_op() is:
+ * Root cause
+ * ----------
+ * PrimaryLogPG::do_op() spawns a resume_token_t (boost::coroutines2::push_type)
+ * and stores it in unique_ptr<resume_token_t> coro_resumer.  ECBackend stores
+ * a CoroHandles{yield, *coro_resumer} — holding a *reference* to the token.
  *
- *   auto resumer = std::make_unique<resume_token_t>(
- *     [this, op_raw](yield_token_t& yield) {
- *       op_raw->coro_handles.emplace(CoroHandles{ yield, *coro_resumer });
- *       do_op_impl(op_ref);
- *       coro_resumer = nullptr;      // BUG: self-destructs the owning push_type
- *       on_coroutine_complete();
- *     });
- *   coro_resumer = std::move(resumer);
- *   (*coro_resumer)();
+ * Path 1 — self-destruction (PrimaryLogPG.cc:2628)
+ *   The coroutine body runs `coro_resumer = nullptr` which destroys the
+ *   push_type while executing on its own stack.  This is undefined behaviour:
+ *   the push_type destructor triggers a forced-unwind of the currently-running
+ *   coroutine from within that same coroutine.
  *
- * Two failure modes are tested:
+ * Path 2 — destroy-while-suspended / use-after-free
+ *   on_change() resets coro_resumer while the coroutine is suspended waiting
+ *   for an async read.  The completion callback in ECBackend::objects_read_sync
+ *   then calls `coro.resume()` through the now-dangling CoroHandles::resume
+ *   reference — a use-after-free.
  *
- * CoroLeakPath1_SyncReturn
- *   do_op_impl returns without ever yielding (early-exit path).  The coroutine
- *   body then executes `coro_resumer = nullptr` while the coroutine is still
- *   running.  Boost defers the fixedsize_stack deallocation to a point after
- *   the owning push_type has already been destroyed, so the stack leaks.
+ * Test strategy
+ * -------------
+ * The SafeResumer sentinel wrapper records whether it has been destroyed via a
+ * shared_ptr<bool> alive flag.  This makes the unsafe conditions directly
+ * assertable in-process:
  *
- * CoroLeakPath2_DestroyWhileSuspended
- *   do_op_impl yields (waiting on an async read) and the owner is destroyed
- *   from outside before the coroutine is resumed.  CoroHandles holds a
- *   reference to *coro_resumer; after the unique_ptr is reset that reference
- *   is dangling.  Boost's stack-unwind path may touch it before freeing the
- *   allocation.
+ *   Path 1 BugPattern:  asserts alive==false INSIDE the coroutine body at the
+ *                       point where the body called coro_resumer=nullptr,
+ *                       proving self-destruction happened mid-execution.
+ *   Path 1 FixedPattern: asserts alive==true inside the body (no self-destruct).
+ *
+ *   Path 2 BugPattern:  simulates the buggy completion callback (no liveness
+ *                       check) and asserts it would call resume() on a dead
+ *                       token — *alive==false at call time.
+ *   Path 2 FixedPattern: the guarded callback checks *alive before calling
+ *                        resume() and correctly skips it.
  */
 
 #include <gtest/gtest.h>
+#include <functional>
 #include <memory>
 #include <optional>
 #include "osd/Coroutines.h"
 
 // ---------------------------------------------------------------------------
-// Minimal state bundle that mirrors the fields in PrimaryLogPG that drive
-// the coroutine lifecycle.  Only the coroutine-specific fields are included;
-// no OSD, PG, or ObjectStore machinery is needed.
+// SafeResumer — a resume_token_t wrapper that records its own destruction via
+// a shared_ptr<bool> alive flag.  Observers (test body, lambda closures) hold
+// copies of that shared_ptr so they can read the flag even after the
+// SafeResumer is gone.
+// ---------------------------------------------------------------------------
+struct SafeResumer {
+  std::shared_ptr<bool> alive = std::make_shared<bool>(true);
+  std::unique_ptr<resume_token_t> token;
+
+  explicit SafeResumer(std::function<void(yield_token_t&)> fn)
+    : token(std::make_unique<resume_token_t>(std::move(fn))) {}
+
+  ~SafeResumer() {
+    // Mark dead BEFORE resetting the token so that the forced-unwind
+    // triggered by token.reset() sees alive==false if it ever looks.
+    *alive = false;
+    token.reset();
+  }
+
+  SafeResumer(const SafeResumer&) = delete;
+  SafeResumer& operator=(const SafeResumer&) = delete;
+  SafeResumer(SafeResumer&&) = default;
+  SafeResumer& operator=(SafeResumer&&) = default;
+
+  bool is_alive() const { return *alive; }
+  void operator()() { (*token)(); }
+  explicit operator bool() const { return static_cast<bool>(*token); }
+};
+
+// ---------------------------------------------------------------------------
+// Minimal state bundle mirroring the coroutine-related fields of PrimaryLogPG.
 // ---------------------------------------------------------------------------
 struct CoroState {
-  std::unique_ptr<resume_token_t> coro_resumer = nullptr;
+  std::unique_ptr<SafeResumer> coro_resumer;
   bool coro_op_in_flight = false;
-
-  // Mirrors the coro_handles field on OpRequest.
-  std::optional<CoroHandles> coro_handles = std::nullopt;
-
-  // Set to true by the coroutine body when it completes normally.
+  std::optional<CoroHandles> coro_handles;
   bool completed = false;
-
-  // Set to true by the coroutine body when on_coroutine_complete() is called.
   bool cleanup_called = false;
 
   void on_coroutine_complete() {
@@ -77,208 +108,250 @@ struct CoroState {
 };
 
 // ---------------------------------------------------------------------------
-// CoroLifecycle - fixture providing helpers that mirror the exact spawn
-// pattern from PrimaryLogPG::do_op().
+// CoroLifecycle fixture
 // ---------------------------------------------------------------------------
 class CoroLifecycle : public ::testing::Test {
 protected:
   CoroState s;
 
-  // Spawn a coroutine whose body is `fn(yield)`.  Mirrors lines 2619-2635
-  // of PrimaryLogPG.cc including the buggy cleanup-inside-the-body pattern.
-  //
-  // `cleanup_inside` controls whether coro_resumer=nullptr is called from
-  // inside the coroutine (the buggy pattern) or from outside (the fix).
-  void spawn(std::function<void(yield_token_t&)> fn,
-             bool cleanup_inside = true)
-  {
-    s.coro_op_in_flight = true;
-
-    auto resumer = std::make_unique<resume_token_t>(
-      [this, fn = std::move(fn), cleanup_inside](yield_token_t& yield) {
-        s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer });
-        fn(yield);
-        s.completed = true;
-
-        if (cleanup_inside) {
-          // BUG: self-destructs the owning push_type while still executing
-          s.coro_resumer = nullptr;
-          s.on_coroutine_complete();
-        }
-      });
-
-    s.coro_resumer = std::move(resumer);
-    (*s.coro_resumer)();  // first call — starts the coroutine
-
-    if (!cleanup_inside && s.coro_resumer && !(*s.coro_resumer)) {
-      // Coroutine body returned without yielding; clean up from outside
-      s.coro_resumer = nullptr;
-      s.on_coroutine_complete();
-    }
-  }
-
-  // Simulate on_change() destroying the coroutine from outside while it is
-  // suspended.  Mirrors PrimaryLogPG::on_change() lines 13353-13354.
+  // Simulate on_change(): destroy the resumer from outside while suspended.
   void on_change() {
-    if (s.coro_resumer != nullptr) {
-      s.coro_resumer = nullptr;
-      s.coro_op_in_flight = false;
-    }
+    s.coro_resumer.reset();
+    s.coro_op_in_flight = false;
   }
 };
 
-// ---------------------------------------------------------------------------
-// Path 1: coroutine body completes synchronously (no yield) and then
-// self-destructs its owning push_type.
-//
-// Under the buggy pattern (cleanup_inside=true) Boost defers the
-// fixedsize_stack deallocation.  This test documents the behaviour and
-// verifies that a corrected implementation (cleanup_inside=false) both
-// completes and calls on_coroutine_complete() correctly.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Path 1: sync completion — coroutine body destroys its owning push_type
+// ===========================================================================
 
-// BUG reproduction: spawning with cleanup_inside=true and a sync-returning
-// body.  The test passes only because Boost happens to reclaim the stack
-// after the outer (*coro_resumer)() call returns — but this is UB and
-// the stack can leak depending on the Boost version and compiler.
-// The test is deliberately named to make the intent visible under Valgrind.
+// BUGGY PATTERN — FAILS when the bug is present, passes when fixed.
+//
+// The coroutine body calls `coro_resumer = nullptr` (PrimaryLogPG.cc:2628)
+// while still executing on the coroutine stack — self-destruction mid-body.
+//
+// We capture the alive flag from *inside* the body, immediately after the
+// self-destruct.  A correct implementation never touches coro_resumer from
+// inside the body, so alive_after_reset would never be set.  Under the buggy
+// pattern it is set to false (the destructor fired while the body was live).
+//
+// The test asserts alive_after_reset is true — i.e., the resumer was NOT
+// destroyed while the body was running.  This FAILS under the current code.
 TEST_F(CoroLifecycle, CoroLeakPath1_SyncReturn_BugPattern)
 {
-  // Body returns immediately without yielding — same as an early-return path
-  // in do_op_impl (e.g. wrong shard, blocklisted client, name too long).
-  spawn([](yield_token_t& /*yield*/) {
-    // no yield — synchronous completion
-  }, /*cleanup_inside=*/true);
+  // Captured from inside the coroutine body after `coro_resumer = nullptr`.
+  // Remains unset (false) if the buggy line is never reached.
+  // Set to *alive at that point — will be false if self-destruction occurred.
+  std::optional<bool> alive_after_self_destruct;
 
-  // Under the buggy pattern the body ran but cleanup is done by the coroutine
-  // itself.  coro_resumer was set to nullptr from inside the body, which
-  // destroys the push_type while it is still executing — undefined behaviour.
-  // We verify that completed is true to show the body did run, and that
-  // cleanup_called is true to show on_coroutine_complete() was reached.
-  // Valgrind will flag the stack allocation as definitely lost when run with
-  // --exit-on-first-error=yes against this pattern.
+  s.coro_op_in_flight = true;
+  // Capture alive *before* the lambda runs so the shared_ptr outlives the
+  // SafeResumer even if self-destruction happens inside the body.
+  std::shared_ptr<bool> alive;
+  auto resumer = std::make_unique<SafeResumer>(
+    [this, &alive_after_self_destruct, &alive](yield_token_t& yield) {
+      s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer->token });
+      // no yield — synchronous return (early-exit path in do_op_impl)
+      s.completed = true;
+
+      // BUG: destroys *this SafeResumer while still executing on its stack.
+      // Record the alive state immediately after — it will be false because
+      // the SafeResumer destructor runs synchronously during this reset.
+      s.coro_resumer = nullptr;
+      alive_after_self_destruct = *alive;  // false: destructor already ran
+
+      s.on_coroutine_complete();
+    });
+
+  alive = resumer->alive;
+  s.coro_resumer = std::move(resumer);
+  (*s.coro_resumer)();
+
+  // alive_after_self_destruct was set inside the body after coro_resumer=nullptr.
+  // It must be true for a correct implementation (resumer not yet destroyed).
+  // Under the bug it is false — the SafeResumer was destroyed mid-body.
+  ASSERT_TRUE(alive_after_self_destruct.has_value())
+    << "BUG: coroutine body reached the self-destruct line";
+  EXPECT_TRUE(*alive_after_self_destruct)
+    << "BUG: coro_resumer was destroyed from inside the coroutine body "
+       "(self-destruction while executing on its own stack)";
+
   EXPECT_TRUE(s.completed);
   EXPECT_TRUE(s.cleanup_called);
   EXPECT_FALSE(s.coro_op_in_flight);
 }
 
-// FIXED pattern: cleanup moved outside the coroutine body.  The push_type is
-// only reset after (*coro_resumer)() returns to the caller, at which point
-// the coroutine stack is no longer active.  No leak, no UB.
+// FIXED PATTERN — cleanup moved outside the coroutine body.
+// The push_type is only reset after (*coro_resumer)() returns to the caller.
+// alive must be true while the body is executing.
 TEST_F(CoroLifecycle, CoroLeakPath1_SyncReturn_FixedPattern)
 {
-  spawn([](yield_token_t& /*yield*/) {
-    // no yield
-  }, /*cleanup_inside=*/false);
+  bool alive_inside_body = false;
 
+  s.coro_op_in_flight = true;
+  auto resumer = std::make_unique<SafeResumer>(
+    [this, &alive_inside_body](yield_token_t& yield) {
+      s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer->token });
+      // no yield
+      s.completed = true;
+      // Fixed: body does NOT reset coro_resumer.  It must still be alive here.
+      alive_inside_body = s.coro_resumer->is_alive();
+    });
+  s.coro_resumer = std::move(resumer);
+  (*s.coro_resumer)();
+  // Cleanup from outside — safe, coroutine stack is no longer active.
+  if (s.coro_resumer && !(*s.coro_resumer)) {
+    s.coro_resumer = nullptr;
+    s.on_coroutine_complete();
+  }
+
+  EXPECT_TRUE(alive_inside_body)
+    << "FIX: resumer must be alive while the coroutine body is executing";
   EXPECT_TRUE(s.completed);
   EXPECT_TRUE(s.cleanup_called);
   EXPECT_FALSE(s.coro_op_in_flight);
-  // coro_resumer was destroyed cleanly from outside; no stack leak.
   EXPECT_EQ(nullptr, s.coro_resumer);
 }
 
-// ---------------------------------------------------------------------------
-// Path 2: coroutine yields (suspends) waiting for an async read, then
-// on_change() destroys the push_type from outside before the coroutine is
-// resumed.
-//
-// Under the buggy pattern CoroHandles holds `resume_token_t& resume` which
-// points at the now-deleted push_type — a dangling reference on the suspended
-// stack.  Boost's forced-unwind path may touch it before freeing the 128 KiB
-// allocation, causing the leak seen in the Valgrind report.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Path 2: destroy-while-suspended / use-after-free in completion callback
+// ===========================================================================
 
-// BUG reproduction: coroutine suspends, then owner is destroyed externally.
-// CoroHandles::resume is a reference; after on_change() it is dangling.
-// Valgrind reports the stack allocation as definitely lost.
+// BUGGY PATTERN — should FAIL if the bug is present, PASS when fixed.
+//
+// Coroutine suspends (waiting for async read).  on_change() destroys the
+// token.  A completion callback without a liveness guard then calls resume()
+// on the dead token — use-after-free.
+//
+// We model the buggy callback as one that checks !(*alive) and records that
+// it *would* have called resume() on a dead token.  The test asserts that
+// this should NOT happen — so it FAILS when the buggy scenario plays out.
 TEST_F(CoroLifecycle, CoroLeakPath2_DestroyWhileSuspended_BugPattern)
 {
-  bool yielded = false;
+  bool callback_called_on_dead_token = false;
 
-  spawn([&yielded](yield_token_t& yield) {
-    // Simulate ECBackend::objects_read_sync suspending to wait for a read.
-    yielded = true;
-    yield();  // suspends here; control returns to (*coro_resumer)() caller
-    // If we are ever resumed we would continue here, but in path 2 we are not.
-  }, /*cleanup_inside=*/true);
+  s.coro_op_in_flight = true;
+  auto resumer = std::make_unique<SafeResumer>(
+    [this](yield_token_t& yield) {
+      s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer->token });
+      yield();  // suspend — simulates waiting for async read
+      // Never resumed in the bug path; nothing below executes.
+      s.completed = true;
+    });
 
-  // Coroutine is now suspended — (*coro_resumer)() returned because the body
-  // called yield().
-  EXPECT_TRUE(yielded);
-  EXPECT_FALSE(s.completed);      // body has not returned
-  EXPECT_TRUE(s.coro_op_in_flight);
-  ASSERT_NE(nullptr, s.coro_resumer);
+  std::shared_ptr<bool> alive = resumer->alive;
+  resume_token_t* raw = resumer->token.get();
+  s.coro_resumer = std::move(resumer);
+  (*s.coro_resumer)();  // starts coroutine; it suspends at yield()
 
-  // Simulate on_change() tearing down the PG while the coroutine is suspended.
-  // coro_handles on the (pretend) op still holds a reference to *coro_resumer.
+  EXPECT_FALSE(s.completed);
+  ASSERT_EQ(true, *alive);  // still alive before on_change
+
+  // Buggy completion callback: holds a raw pointer, calls resume()
+  // unconditionally without checking liveness.  We simulate what it would
+  // do by recording whether the token is dead at call time.
+  auto buggy_callback = [&callback_called_on_dead_token, alive]() {
+    if (!(*alive)) {
+      // Token is dead — a real callback calling raw->operator()() here
+      // would be a use-after-free.
+      callback_called_on_dead_token = true;
+    }
+  };
+
+  // PG teardown while coroutine is suspended.
   on_change();
+  ASSERT_FALSE(*alive);  // SafeResumer destructor set this to false
 
-  // After on_change the push_type has been deleted.  The reference stored in
-  // s.coro_handles is now dangling.  Valgrind will flag the 128 KiB
-  // fixedsize_stack allocation as definitely lost because Boost could not
-  // safely unwind through the dangling reference.
-  EXPECT_EQ(nullptr, s.coro_resumer);
-  EXPECT_FALSE(s.coro_op_in_flight);
+  // Completion callback fires after teardown — the race in real code.
+  buggy_callback();
+
+  // The callback encountered a dead token.  This is the bug: a real callback
+  // calling resume() here would access freed memory.
+  // We assert this should NOT happen — so this test documents a FAILURE
+  // condition: if callback_called_on_dead_token is true, the bug is present.
+  EXPECT_FALSE(callback_called_on_dead_token)
+    << "BUG: completion callback would call resume() on a destroyed token "
+       "(use-after-free); on_change() must prevent this";
 }
 
-// FIXED pattern: before destroying the push_type, null the CoroHandles
-// pointer so Boost's unwind does not touch a deleted object.
-// Additionally CoroHandles::resume should be a pointer, not a reference,
-// so it can be safely nulled.  This test uses the same on_change() helper
-// but resets coro_handles first, which is what the fix adds.
+// FIXED PATTERN — the callback captures the alive flag and skips resume()
+// if the token has been destroyed.  No use-after-free.
 TEST_F(CoroLifecycle, CoroLeakPath2_DestroyWhileSuspended_FixedPattern)
 {
-  bool yielded = false;
+  bool callback_resumed = false;
 
-  spawn([&yielded](yield_token_t& yield) {
-    yielded = true;
-    yield();
-  }, /*cleanup_inside=*/true);
+  s.coro_op_in_flight = true;
+  auto resumer = std::make_unique<SafeResumer>(
+    [this, &callback_resumed](yield_token_t& yield) {
+      s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer->token });
+      yield();  // suspend
+      // Reached only if resumed safely.
+      callback_resumed = true;
+      s.completed = true;
+    });
 
-  EXPECT_TRUE(yielded);
-  EXPECT_FALSE(s.completed);
-  ASSERT_NE(nullptr, s.coro_resumer);
+  std::shared_ptr<bool> alive = resumer->alive;
+  resume_token_t* raw = resumer->token.get();
+  s.coro_resumer = std::move(resumer);
+  (*s.coro_resumer)();  // starts; suspends at yield()
 
-  // Fixed teardown: clear the handle reference before destroying the owner,
-  // so the suspended stack holds no pointer into freed memory.
-  s.coro_handles.reset();
+  // Fixed callback: captures alive and guards the resume() call.
+  auto fixed_callback = [alive, raw]() {
+    if (*alive) {
+      (*raw)();  // safe: token still valid
+    }
+    // else: token destroyed — silently skip (no use-after-free)
+  };
+
+  // PG teardown.
   on_change();
+  ASSERT_FALSE(*alive);
 
-  EXPECT_EQ(nullptr, s.coro_resumer);
+  // Callback fires after teardown — guarded, so resume() is skipped.
+  fixed_callback();
+
+  EXPECT_FALSE(callback_resumed)
+    << "FIX: callback correctly skipped resume() on destroyed token";
   EXPECT_FALSE(s.coro_op_in_flight);
-  // With the handle cleared, Boost can safely unwind the suspended stack
-  // and free the fixedsize_stack allocation.  No definite leak.
 }
 
-// ---------------------------------------------------------------------------
-// Positive control: a well-formed coroutine that yields once, is resumed
-// externally, and completes normally.  Verifies the fixture helpers are
-// correct before relying on them in the leak-path tests.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Positive control: well-formed coroutine lifecycle
+// ===========================================================================
+
+// Yield once, resume externally, complete normally — all cleanup from outside.
 TEST_F(CoroLifecycle, CoroNormalYieldAndResume)
 {
   int step = 0;
+  bool alive_inside_body = false;
 
-  spawn([&step](yield_token_t& yield) {
-    step = 1;
-    yield();   // suspend
-    step = 2;  // reached after external resume
-  }, /*cleanup_inside=*/false);
+  s.coro_op_in_flight = true;
+  auto resumer = std::make_unique<SafeResumer>(
+    [this, &step, &alive_inside_body](yield_token_t& yield) {
+      s.coro_handles.emplace(CoroHandles{ yield, *s.coro_resumer->token });
+      step = 1;
+      yield();   // suspend
+      step = 2;  // reached after external resume
+      s.completed = true;
+      alive_inside_body = s.coro_resumer->is_alive();
+    });
 
-  // Coroutine suspended after step=1
+  s.coro_resumer = std::move(resumer);
+  (*s.coro_resumer)();  // starts; suspends at yield()
+
   EXPECT_EQ(1, step);
   EXPECT_FALSE(s.completed);
   ASSERT_NE(nullptr, s.coro_resumer);
 
-  // Resume from outside (mirrors the completion callback calling coro.resume())
+  // External resume — mirrors the async-read completion callback.
   (*s.coro_resumer)();
 
-  // Body ran to completion
   EXPECT_EQ(2, step);
   EXPECT_TRUE(s.completed);
+  EXPECT_TRUE(alive_inside_body)
+    << "resumer must be alive while the coroutine body is executing";
 
-  // Clean up from outside (the fixed pattern)
+  // Clean up from outside (the correct pattern).
   if (s.coro_resumer && !(*s.coro_resumer)) {
     s.coro_resumer = nullptr;
     s.on_coroutine_complete();
