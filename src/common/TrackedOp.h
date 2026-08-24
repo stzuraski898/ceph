@@ -126,6 +126,10 @@ public:
 
   CephContext *cct;
   OpTracker(CephContext *cct_, bool tracking, uint32_t num_shards);
+  
+  void shutdown() {
+    history.on_shutdown();
+  }
       
   void set_complaint_and_threshold(float time, int threshold) {
     complaint_time = time;

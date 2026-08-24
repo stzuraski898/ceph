@@ -34,6 +34,10 @@ public:
   PyModuleRef py_module;
 
 protected:
+#ifdef UNIT_TESTS_BUILT
+  friend class ActivePyModulesTestHelper;
+  friend class ActivePyModulesTest;
+#endif
   // Populated by descendent class
   PyObject *pClassInstance = nullptr;
 

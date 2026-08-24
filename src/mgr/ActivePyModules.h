@@ -48,6 +48,7 @@ class PyModuleRegistry;
 
 class ActivePyModules
 {
+protected:
   // module class instances not yet created
   std::set<std::string, std::less<>> pending_modules;
   // This context is set during mgr initialization when
@@ -77,6 +78,7 @@ private:
 
   std::map<std::string,ProgressEvent> progress_events;
 
+protected:
   mutable ceph::mutex lock = ceph::make_mutex("ActivePyModules::lock");
 
 public:
@@ -269,7 +271,6 @@ public:
   PyObject* get_daemon_health_metrics();
 
   bool inject_python_on() const;
-  void update_cache_metrics();
   // Sends the "active" beacon right away if all mgr modules
   // have finished startup. If some modules are still pending
   // startup, the "active" beacon is scheduled to send later
