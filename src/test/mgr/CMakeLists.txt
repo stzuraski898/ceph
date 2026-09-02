@@ -81,6 +81,61 @@ add_ceph_unittest(unittest_mgr_map_cache)
 target_link_libraries(unittest_mgr_map_cache ceph-common
   Python3::Python ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
 
+# unittest_mgr_daemonserver
+add_executable(unittest_mgr_daemonserver
+  test_daemonserver.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ActivePyModule.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ActivePyModules.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/BaseMgrModule.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/BaseMgrStandbyModule.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonServer.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonHealthMetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonHealthMetric.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonState.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonPerfCounters.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PerfCounterInstance.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonKey.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ClusterState.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ServiceMap.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/OSDPerfMetricTypes.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/OSDPerfMetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MgrOpRequest.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/mgr_perf_counters.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/mgr_commands.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MgrMapCache.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyFormatter.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyModuleRunner.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyUtil.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyModule.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyModuleRegistry.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PyOSDMap.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/Gil.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/StandbyPyModules.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ThreadMonitor.cc
+  $<TARGET_OBJECTS:mgr_cap_obj>
+)
+add_ceph_unittest(unittest_mgr_daemonserver)
+target_compile_definitions(unittest_mgr_daemonserver PRIVATE UNIT_TESTS_BUILT)
+target_include_directories(unittest_mgr_daemonserver PRIVATE
+  $<TARGET_PROPERTY:RocksDB::RocksDB,INTERFACE_INCLUDE_DIRECTORIES>)
+if(WITH_LTTNG)
+  add_dependencies(unittest_mgr_daemonserver mgr_op_tp)
+endif()
+target_link_libraries(unittest_mgr_daemonserver
+  ceph-common
+  osdc
+  mon
+  global
+  Boost::python${MGR_PYTHON_VERSION_MAJOR}${MGR_PYTHON_VERSION_MINOR}
+  Python3::Python
+  ${CMAKE_DL_LIBS}
+  $<$<BOOL:${WITH_LIBCEPHSQLITE}>:cephsqlite>
+  $<$<BOOL:${WITH_LIBCEPHSQLITE}>:SQLite3::SQLite3>
+)
+
 #scripts
 if(WITH_MGR_DASHBOARD_FRONTEND)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm|ARM")

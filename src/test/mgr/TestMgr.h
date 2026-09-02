@@ -6,11 +6,19 @@
 #include <cassert>
 
 #include "common/async/context_pool.h"
+#include "common/Finisher.h"
+#include "common/LogClient.h"
 #include "global/global_context.h"
+#include "global/global_init.h"
 #include "gtest/gtest.h"
 #include "messages/MPGStats.h"
+#include "messages/MMgrReport.h"
 #include "mgr/ClusterState.h"
+#include "mgr/DaemonServer.h"
 #include "mgr/DaemonState.h"
+#include "mgr/PyModuleRegistry.h"
+#include "mgr/ThreadMonitor.h"
+#include "mgr/Mgr.h"
 #include "mon/MgrMap.h"
 #include "mon/MonClient.h"
 #include "msg/Messenger.h"
@@ -82,6 +90,7 @@ public:
     mc = std::make_unique<MonClient>(cct.get(), *icp);
     messenger.reset(
         Messenger::create_client_messenger(cct.get(), "unittest_mgr"));
+    messenger->start();
     objecter =
         std::make_unique<Objecter>(cct.get(), messenger.get(), mc.get(), *icp);
 
@@ -188,3 +197,48 @@ struct PythonEnv : public ::testing::Environment {
     Py_Finalize();
   }
 };
+
+class DaemonServerTestHelper : public TestMgr {
+public:
+  std::unique_ptr<LogClient> log_client;
+  LogChannelRef clog;
+  LogChannelRef audit_clog;
+  std::unique_ptr<PyModuleRegistry> py_registry;
+  std::unique_ptr<DaemonStateIndex> daemon_state_index;
+  std::unique_ptr<Finisher> finisher;
+  std::unique_ptr<DaemonServer> daemon_server;
+
+  void SetUp() override {
+    TestMgr::SetUp();
+    log_client = std::make_unique<LogClient>(cct.get(), messenger.get(), &mc->monmap, LogClient::NO_FLAGS);
+    clog = log_client->create_channel("cluster");
+    audit_clog = log_client->create_channel("audit");
+    daemon_state_index = std::make_unique<DaemonStateIndex>();
+    py_registry = std::make_unique<PyModuleRegistry>(clog);
+    finisher = std::make_unique<Finisher>(cct.get(), "test_finisher", "test_fin");
+    finisher->start();
+    daemon_server = std::make_unique<DaemonServer>(
+        mc.get(),
+        *finisher,
+        *daemon_state_index,
+        *cs,
+        *py_registry,
+        clog,
+        audit_clog);
+  }
+
+  void TearDown() override {
+    daemon_server.reset();
+    py_registry.reset();
+    if (finisher) {
+      finisher->stop();
+      finisher.reset();
+    }
+    daemon_state_index.reset();
+    audit_clog.reset();
+    clog.reset();
+    log_client.reset();
+    TestMgr::TearDown();
+  }
+};
+
