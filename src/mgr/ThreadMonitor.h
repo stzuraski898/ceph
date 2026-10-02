@@ -37,9 +37,14 @@ public:
       monitoring_interval(std::chrono::seconds(m_cct->_conf.get_val<int64_t>("mgr_module_monitor_interval")))
   {
     m_cct->_conf.add_observer(this);
-    m_clock_ticks_per_sec = sysconf(_SC_CLK_TCK);
-    m_page_size = sysconf(_SC_PAGESIZE);
+    m_clock_ticks_per_sec = sysconf_fn(_SC_CLK_TCK);
+    m_page_size = sysconf_fn(_SC_PAGESIZE);
   }
+
+  // Test seam: the function used to query sysconf(3) values at construction.
+  // Defaults to ::sysconf and is only overridden by unit tests that need to
+  // simulate a sysconf failure (return -1); production behaviour is unchanged.
+  static long (*sysconf_fn)(int);
 
   ~ThreadMonitor() {
     m_cct->_conf.remove_observer(this);

@@ -20,6 +20,9 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "mgr[ThreadMonitor] " << __func__ << " "
 
+// Test seam default: use the real sysconf(3) in production builds.
+long (*ThreadMonitor::sysconf_fn)(int) = ::sysconf;
+
 void ThreadMonitor::start_monitoring() {
   if (running.exchange(true)) {
     return;
@@ -30,9 +33,14 @@ void ThreadMonitor::start_monitoring() {
 }
 
 void ThreadMonitor::stop_monitoring() {
-  if (!running.exchange(false)) {
-    return;
-  }
+  // Signal the loop to stop. We must NOT gate the join below on the value of
+  // `running`: the monitoring_loop() sysconf-failure guard sets `running=false`
+  // from inside the thread, so by the time stop_monitoring() runs the flag may
+  // already be false even though the thread object is still joinable. Gating the
+  // join on `running` would then skip join() and leave a joinable std::thread to
+  // be destroyed, which calls std::terminate(). Always join whenever joinable;
+  // join() leaves the thread non-joinable, so this stays idempotent.
+  running.store(false);
 
   if (monitor_thread && monitor_thread->joinable()) {
     monitor_thread->join();
