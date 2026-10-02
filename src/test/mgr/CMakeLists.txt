@@ -73,6 +73,18 @@ target_link_libraries(unittest_mgr_servicemap
   ceph-common
 )
 
+# unittest_mgr_threadmonitor
+add_executable(unittest_mgr_threadmonitor
+  test_threadmonitor.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ThreadMonitor.cc
+)
+add_ceph_unittest(unittest_mgr_threadmonitor)
+target_link_libraries(unittest_mgr_threadmonitor
+  ceph-common
+  global
+  Python3::Python
+)
+
 # unittest_mgr_map_cache
 add_executable(unittest_mgr_map_cache
   test_mgrmapcache.cc
