@@ -108,6 +108,14 @@ add_ceph_unittest(unittest_mgr_map_cache)
 target_link_libraries(unittest_mgr_map_cache ceph-common
   Python3::Python ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
 
+# unittest_mgr_map_cache_ordering
+add_executable(unittest_mgr_map_cache_ordering
+  test_mgrmapcache_ordering.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MgrMapCache.cc)
+add_ceph_unittest(unittest_mgr_map_cache_ordering)
+target_link_libraries(unittest_mgr_map_cache_ordering ceph-common global
+  Python3::Python ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
+
 #scripts
 if(WITH_MGR_DASHBOARD_FRONTEND)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm|ARM")
