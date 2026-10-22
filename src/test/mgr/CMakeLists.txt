@@ -92,6 +92,13 @@ add_executable(unittest_mgr_mgrcap
 add_ceph_unittest(unittest_mgr_mgrcap)
 target_link_libraries(unittest_mgr_mgrcap global)
 
+# unittest_mgr_mgrcap_ordering
+add_executable(unittest_mgr_mgrcap_ordering
+  test_mgrcap_ordering.cc
+  $<TARGET_OBJECTS:mgr_cap_obj>)
+add_ceph_unittest(unittest_mgr_mgrcap_ordering)
+target_link_libraries(unittest_mgr_mgrcap_ordering global)
+
 # unittest_mgr_pyformatter
 add_executable(unittest_mgr_pyformatter
   test_pyformatter.cc
