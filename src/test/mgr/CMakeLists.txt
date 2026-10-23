@@ -10,6 +10,18 @@ target_link_libraries(unittest_mgr_clusterstate
   Python3::Python
 )
 
+# unittest_mgr_clusterstate_ordering
+add_executable(unittest_mgr_clusterstate_ordering
+  test_clusterstate_ordering.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/ClusterState.cc
+)
+add_ceph_unittest(unittest_mgr_clusterstate_ordering)
+target_link_libraries(unittest_mgr_clusterstate_ordering
+  ceph-common
+  global
+  Python3::Python
+)
+
 # unittest_mgr_daemonkey
 add_executable(unittest_mgr_daemonkey
   test_daemonkey.cc
