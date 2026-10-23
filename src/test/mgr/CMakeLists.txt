@@ -85,6 +85,19 @@ target_link_libraries(unittest_mgr_daemonstate_ordering
   Python3::Python
 )
 
+# unittest_mgr_daemonperfcounters_ordering
+add_executable(unittest_mgr_daemonperfcounters_ordering
+  test_daemonperfcounters_ordering.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/DaemonPerfCounters.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/PerfCounterInstance.cc
+)
+add_ceph_unittest(unittest_mgr_daemonperfcounters_ordering)
+target_link_libraries(unittest_mgr_daemonperfcounters_ordering
+  ceph-common
+  global
+  Python3::Python
+)
+
 # unittest_mgr_mgrcap
 add_executable(unittest_mgr_mgrcap
   test_mgrcap.cc
