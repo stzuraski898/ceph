@@ -116,6 +116,21 @@ add_ceph_unittest(unittest_mgr_map_cache_ordering)
 target_link_libraries(unittest_mgr_map_cache_ordering ceph-common global
   Python3::Python ${CMAKE_DL_LIBS} ${GSSAPI_LIBRARIES})
 
+# unittest_mgr_metriccollector_ordering
+add_executable(unittest_mgr_metriccollector_ordering
+  test_metriccollector_ordering.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/OSDPerfMetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/OSDPerfMetricTypes.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricCollector.cc
+  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc
+)
+add_ceph_unittest(unittest_mgr_metriccollector_ordering)
+target_link_libraries(unittest_mgr_metriccollector_ordering
+  ceph-common
+  global
+)
+
 #scripts
 if(WITH_MGR_DASHBOARD_FRONTEND)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm|ARM")
